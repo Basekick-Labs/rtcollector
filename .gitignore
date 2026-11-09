@@ -58,3 +58,6 @@ Thumbs.db
 lib/
 bin/
 __pycache__
+# Local runtime configuration may contain credentials
+config.yml
+config.yaml
