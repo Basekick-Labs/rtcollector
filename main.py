@@ -91,7 +91,7 @@ def main():
             
             if plugin_config:
                 if config.get("debug", False) or args.debug:
-                    print(f"[DEBUG] Loading plugin: {plugin_name} with config: {plugin_config}")
+                    print(f"[DEBUG] Loading plugin: {plugin_name}")
                 def make_collector(mod, plugin_config):
                     def collect_with_config():
                         result = mod.collect(plugin_config)
