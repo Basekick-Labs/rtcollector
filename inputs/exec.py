@@ -4,7 +4,23 @@ import os
 import time
 import platform
 import shlex
+import threading
+import signal
 from core.metric import Metric
+
+def _read_bounded_stream(stream, max_bytes):
+    """Drain a subprocess pipe fully while retaining at most max_bytes."""
+    captured = bytearray()
+    total = 0
+    while True:
+        chunk = stream.read(8192)
+        if not chunk:
+            break
+        total += len(chunk)
+        remaining = max_bytes - len(captured)
+        if remaining > 0:
+            captured.extend(chunk[:remaining])
+    return bytes(captured), total
 
 def collect(config=None):
     metrics = []
@@ -27,7 +43,7 @@ def collect(config=None):
     ignore_error = config.get("ignore_error", False)
     working_dir = config.get("working_dir", None)
     shell = config.get("shell", True)
-    max_output_size = config.get("max_output_size", 1048576)  # 1MB default
+    max_output_size = max(0, int(config.get("max_output_size", 1048576)))  # 1MB per stream
     add_hostname = config.get("add_hostname", True)
     
     # Set up environment variables
@@ -47,26 +63,75 @@ def collect(config=None):
             # Prepare command (split if shell=False)
             cmd_to_run = cmd if shell else shlex.split(cmd)
             
-            # Execute command
-            result = subprocess.run(
-                cmd_to_run, 
-                shell=shell, 
-                capture_output=True, 
-                text=True, 
-                env=env_vars, 
-                timeout=timeout,
-                cwd=working_dir
+            # Drain both pipes concurrently while retaining only a bounded
+            # prefix of each. subprocess.run(capture_output=True) buffers the
+            # complete output before max_output_size can be applied.
+            process = subprocess.Popen(
+                cmd_to_run,
+                shell=shell,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=False,
+                env=env_vars,
+                cwd=working_dir,
+                start_new_session=(os.name == "posix")
             )
-            
+            captured = {}
+            stdout_reader = threading.Thread(
+                target=lambda: captured.setdefault("stdout", _read_bounded_stream(process.stdout, max_output_size)),
+                daemon=True,
+            )
+            stderr_reader = threading.Thread(
+                target=lambda: captured.setdefault("stderr", _read_bounded_stream(process.stderr, max_output_size)),
+                daemon=True,
+            )
+            stdout_reader.start()
+            stderr_reader.start()
+            try:
+                returncode = process.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                if os.name == "posix":
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                else:
+                    process.kill()
+                process.wait()
+                stdout_reader.join()
+                stderr_reader.join()
+                raise
+            stdout_reader.join()
+            stderr_reader.join()
+            process.stdout.close()
+            process.stderr.close()
+            stdout_bytes, stdout_total = captured["stdout"]
+            stderr_bytes, stderr_total = captured["stderr"]
+            stdout = stdout_bytes.decode("utf-8", errors="replace")
+            stderr = stderr_bytes.decode("utf-8", errors="replace")
+
             # Calculate execution time
             execution_time = time.time() - cmd_start_time
-            
-            # Check for command failure
-            if result.returncode != 0 and not ignore_error:
+
+            if stdout_total > max_output_size:
                 cmd_logs.append({
-                    "message": f"Command '{cmd}' failed with code {result.returncode}: {result.stderr.strip()}",
+                    "message": f"Command stdout truncated, {stdout_total - max_output_size} bytes omitted (limit {max_output_size})",
+                    "level": "warn",
+                    "tags": {"source": "exec", "cmd": cmd, "stream": "stdout"}
+                })
+            if stderr_total > max_output_size:
+                cmd_logs.append({
+                    "message": f"Command stderr truncated, {stderr_total - max_output_size} bytes omitted (limit {max_output_size})",
+                    "level": "warn",
+                    "tags": {"source": "exec", "cmd": cmd, "stream": "stderr"}
+                })
+
+            # Check for command failure
+            if returncode != 0 and not ignore_error:
+                cmd_logs.append({
+                    "message": f"Command '{cmd}' failed with code {returncode}: {stderr.strip()}",
                     "level": "error",
-                    "tags": {"source": "exec", "cmd": cmd, "exit_code": str(result.returncode)}
+                    "tags": {"source": "exec", "cmd": cmd, "exit_code": str(returncode)}
                 })
                 
                 # Add execution time metric even for failed commands
@@ -80,18 +145,6 @@ def collect(config=None):
                 metrics.extend(cmd_metrics)
                 logs.extend(cmd_logs)
                 continue
-
-            # Truncate output if too large
-            stdout = result.stdout
-            stderr = result.stderr
-            if len(stdout) > max_output_size:
-                truncated_size = len(stdout) - max_output_size
-                stdout = stdout[:max_output_size]
-                cmd_logs.append({
-                    "message": f"Command output truncated, {truncated_size} bytes omitted",
-                    "level": "warn",
-                    "tags": {"source": "exec", "cmd": cmd}
-                })
 
             # Process output based on format
             if data_format == "json":
